@@ -1,8 +1,8 @@
-﻿# linkedin-recon
+# linkedin-recon
 
 > Red team security tool — authorized use only.
 
-`ash
+```bash
 python linkedin_recon.py --help
 ```
 
