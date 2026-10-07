@@ -1,139 +1,212 @@
 #!/usr/bin/env python3
-"""
-LinkedIn Recon — OSINT Employee & Org Intelligence via LinkedIn
-Extracts employee names, titles, and tech stack signals via Google dork + public data.
-Author: Omar Khalid (amooryx) | github.com/amooryx/linkedin-recon
-AUTHORIZED USE ONLY — for authorized red team engagements and OSINT research.
-"""
+"""Build scoped search links for manual review of public professional sources."""
 
 import argparse
 import json
-import re
+import os
 import sys
-import time
-import urllib.parse
-import urllib.request
-import urllib.error
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 
-# Google dorking URLs (no API key required)
-GOOGLE_DORK = "https://www.google.com/search?q=site:linkedin.com+%22{company}%22+%22{title}%22&num=20"
-BING_DORK   = "https://www.bing.com/search?q=site:linkedin.com/in+%22{company}%22&count=50"
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+TOOL_NAME = "linkedin-recon"
+SCHEMA_VERSION = 1
+SEARCH_ENGINES = {
+    "google": "https://www.google.com/search",
+    "bing": "https://www.bing.com/search",
+}
+TECH_TERMS = (
+    '"AWS" OR "Azure" OR "GCP" OR Kubernetes OR Terraform OR Ansible OR '
+    "Python OR Go OR Java OR C# OR JavaScript OR TypeScript OR Ruby OR Rust OR "
+    'React OR Django OR Spring OR Rails OR Laravel OR "Node.js" OR Angular'
+)
+DISCLAIMER = (
+    "Search links only. Review results manually and follow source terms, "
+    "applicable law, and your authorization."
+)
 
-def dork_search(engine: str, company: str, title: str = "Engineer") -> list[dict]:
-    if engine == "google":
-        url = GOOGLE_DORK.format(
-            company=urllib.parse.quote(company),
-            title=urllib.parse.quote(title)
+
+def _clean_scope_value(value: str, label: str, limit: int) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError(f"{label} must not be empty")
+    if len(cleaned) > limit:
+        raise ValueError(f"{label} must be no more than {limit} characters")
+    if any(ord(char) < 32 or ord(char) == 127 for char in cleaned):
+        raise ValueError(f"{label} must not contain control characters")
+    return cleaned
+
+
+def _quoted_phrase(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _search_link(engine: str, query: str) -> str:
+    return f"{SEARCH_ENGINES[engine]}?{urlencode({'q': query})}"
+
+
+def build_search_plan(
+    company: str,
+    title: str = "Engineer",
+    engine: str = "google",
+    include_tech: bool = False,
+) -> Dict[str, Any]:
+    """Return a query plan; this function does not make network requests."""
+    company = _clean_scope_value(company, "Company", 120)
+    title = _clean_scope_value(title, "Title", 80)
+    if engine not in SEARCH_ENGINES:
+        raise ValueError(f"Unsupported search engine: {engine}")
+
+    company_phrase = _quoted_phrase(company)
+    profile_query = f"site:linkedin.com/in {company_phrase} {_quoted_phrase(title)}"
+    searches: List[Dict[str, str]] = [
+        {
+            "type": "employee_profiles",
+            "engine": engine,
+            "query": profile_query,
+            "url": _search_link(engine, profile_query),
+        }
+    ]
+    if include_tech:
+        tech_query = f"{company_phrase} jobs engineering ({TECH_TERMS})"
+        searches.append(
+            {
+                "type": "job_posting_technology_signals",
+                "engine": engine,
+                "query": tech_query,
+                "url": _search_link(engine, tech_query),
+            }
         )
-    else:
-        url = BING_DORK.format(company=urllib.parse.quote(company))
 
-    req = urllib.request.Request(url)
-    req.add_header("User-Agent", UA)
-    req.add_header("Accept-Language", "en-US,en;q=0.9")
+    return {
+        "tool": TOOL_NAME,
+        "schema_version": SCHEMA_VERSION,
+        "scope": {"company": company, "title": title},
+        "searches": searches,
+        "notice": DISCLAIMER,
+    }
 
-    results = []
+
+def render_text(plan: Dict[str, Any]) -> str:
+    scope = plan["scope"]
+    lines = [
+        f"Search plan for {scope['company']} — {scope['title']}",
+        "No pages were fetched; open and review these search links manually.",
+    ]
+    for search in plan["searches"]:
+        lines.extend(
+            [
+                "",
+                f"[{search['type']}] via {search['engine']}",
+                f"Query: {search['query']}",
+                f"URL: {search['url']}",
+            ]
+        )
+    lines.extend(["", plan["notice"]])
+    return "\n".join(lines) + "\n"
+
+
+def _write_atomically(path: Path, content: str) -> None:
+    if not path.parent.is_dir():
+        raise OSError(f"Output directory does not exist: {path.parent}")
+
+    temp_path: Optional[str] = None
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read(65536).decode(errors="ignore")
-            # Extract LinkedIn profile URLs
-            profile_urls = re.findall(r"https?://(?:www\.)?linkedin\.com/in/([a-zA-Z0-9\-]+)", html)
-            # Extract names from title snippets
-            names = re.findall(r'<h3[^>]*>([^<]{5,80})</h3>', html)
-            for slug in set(profile_urls[:20]):
-                results.append({
-                    "profile_url": f"https://www.linkedin.com/in/{slug}",
-                    "slug": slug,
-                })
-            for name in names[:10]:
-                name = re.sub(r"<[^>]+>", "", name).strip()
-                if "linkedin" in name.lower() or len(name) < 5:
-                    continue
-                results.append({"name": name, "source": "google_snippet"})
-    except Exception as e:
-        results.append({"error": str(e)})
-    return results
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+            delete=False,
+        ) as output:
+            temp_path = output.name
+            output.write(content)
+        os.replace(temp_path, path)
+    except OSError:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise
 
-def guess_emails_from_names(names: list[str], domain: str) -> list[str]:
-    """Generate email format guesses from a list of names."""
-    emails = []
-    for name in names:
-        parts = name.strip().split()
-        if len(parts) < 2:
-            continue
-        first, last = parts[0].lower(), parts[-1].lower()
-        f = first[0]
-        l = last[0]
-        for fmt in [f"{first}.{last}", f"{f}{last}", f"{first}{l}", f"{first}_{last}"]:
-            emails.append(f"{fmt}@{domain}")
-    return list(set(emails))
 
-def infer_tech_stack_signals(company: str) -> dict:
-    """Look for tech job postings to infer tech stack (via Google)."""
-    url = f"https://www.google.com/search?q={urllib.parse.quote(company)}+jobs+engineer+%22AWS%20OR%20Azure%20OR%20GCP%20OR%20Kubernetes%22&num=10"
-    req = urllib.request.Request(url)
-    req.add_header("User-Agent", UA)
-    signals = {"cloud": [], "languages": [], "frameworks": []}
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read(32768).decode(errors="ignore").lower()
-            for kw in ["aws", "azure", "gcp", "kubernetes", "terraform", "ansible"]:
-                if kw in html:
-                    signals["cloud"].append(kw)
-            for kw in ["python", "go", "java", "c#", "javascript", "typescript", "ruby", "rust"]:
-                if kw in html:
-                    signals["languages"].append(kw)
-            for kw in ["react", "django", "spring", "rails", "laravel", "node.js", "angular"]:
-                if kw in html:
-                    signals["frameworks"].append(kw)
-    except Exception:
-        pass
-    return signals
+def _scope_argument(label: str, limit: int):
+    def parse(value: str) -> str:
+        try:
+            return _clean_scope_value(value, label, limit)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(str(error))
 
-def main():
+    return parse
+
+
+def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="LinkedIn Recon — Employee OSINT (Authorized use only)",
+        description=(
+            "Build manually reviewed search links for public professional sources. "
+            "This tool does not fetch search results or profile pages."
+        ),
+        epilog=DISCLAIMER,
     )
-    parser.add_argument("company",     help="Target company name")
-    parser.add_argument("--domain",    help="Email domain for format guesses (e.g., company.com)")
-    parser.add_argument("--title",     default="Engineer", help="Job title to search")
-    parser.add_argument("--engine",    choices=["google", "bing"], default="google")
-    parser.add_argument("--tech",      action="store_true", help="Infer tech stack from job signals")
-    parser.add_argument("--out",       help="Output JSON file")
-    args = parser.parse_args()
+    parser.add_argument(
+        "company",
+        type=_scope_argument("Company", 120),
+        help="Company name to include in the search scope",
+    )
+    parser.add_argument(
+        "--title",
+        default="Engineer",
+        type=_scope_argument("Title", 80),
+        help="Job title to include in the profile search (default: Engineer)",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=sorted(SEARCH_ENGINES),
+        default="google",
+        help="Search engine whose query link to generate (default: google)",
+    )
+    parser.add_argument(
+        "--tech",
+        action="store_true",
+        help="Also generate a search for technology terms in job postings",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format (default: text)",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        help="Write output to this file instead of standard output",
+    )
+    return parser
 
-    print(f"[*] LinkedIn OSINT for '{args.company}' via {args.engine}")
-    results = {}
 
-    profiles = dork_search(args.engine, args.company, args.title)
-    print(f"[+] {len(profiles)} profiles/snippets found")
-    for p in profiles[:10]:
-        if "profile_url" in p:
-            print(f"    {p['profile_url']}")
-        elif "name" in p:
-            print(f"    Name: {p['name']}")
-    results["profiles"] = profiles
-
-    if args.domain:
-        names = [p["name"] for p in profiles if "name" in p]
-        emails = guess_emails_from_names(names, args.domain)
-        print(f"[+] Email format guesses: {len(emails)}")
-        for e in emails[:10]:
-            print(f"    {e}")
-        results["email_guesses"] = emails
-
-    if args.tech:
-        print(f"[*] Inferring tech stack signals ...")
-        tech = infer_tech_stack_signals(args.company)
-        print(f"[+] Cloud: {tech['cloud']}  Languages: {tech['languages']}  Frameworks: {tech['frameworks']}")
-        results["tech_stack_signals"] = tech
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = create_parser()
+    args = parser.parse_args(argv)
+    plan = build_search_plan(args.company, args.title, args.engine, args.tech)
+    content = (
+        json.dumps(plan, ensure_ascii=False, indent=2) + "\n"
+        if args.format == "json"
+        else render_text(plan)
+    )
 
     if args.out:
-        with open(args.out, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"[*] Results → {args.out}")
+        try:
+            _write_atomically(args.out, content)
+        except OSError as error:
+            print(f"linkedin-recon: could not write output: {error}", file=sys.stderr)
+            return 2
+        print(f"Search plan written to {args.out}", file=sys.stderr)
+    else:
+        sys.stdout.write(content)
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

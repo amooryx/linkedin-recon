@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linkedin-recon"
+version = "1.0.0"
+description = "A network-free search-link planner for manual public-source review"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Omar Khalid" }]
+dependencies = []
+
+[project.scripts]
+linkedin-recon = "linkedin_recon:main"
+
+[tool.setuptools]
+py-modules = ["linkedin_recon"]
